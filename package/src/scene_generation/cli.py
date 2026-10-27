@@ -361,6 +361,7 @@ def main():
             ],
             args.data_dir,
             None,
+            osm_server_addr=args.osm_server_addr,
             lidar_height_calibration=args.enable_lidar_height_calibration,
             generate_building_map=args.enable_building_map,
             ground_material_type=list(ITU_MATERIALS.items())[args.ground_material][0],
@@ -463,10 +464,12 @@ def main():
         directory = args.data_dir
         if not os.path.isdir(directory):
             print(f"Error: The provided path '{directory}' is not a valid directory.")
+            sys.exit(1)
 
         scene_file = os.path.join(directory, "scene.xml")
         if not os.path.isfile(scene_file):
             print(f"Error: 'scene.xml' not found in '{directory}'.")
+            sys.exit(1)
 
         try:
             # Parse the XML file
