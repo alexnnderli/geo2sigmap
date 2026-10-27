@@ -45,6 +45,183 @@ logger = logging.getLogger(__name__)
 # with the ground/terrain mesh (which causes z-fighting in the renderer).
 ROAD_Z_OFFSET_M = 0.1
 
+TERRAIN_MODE_LIDAR = "lidar"
+TERRAIN_MODE_DEM = "dem"
+LIDAR_TERRAIN_PLY = "lidar_terrain.ply"
+DEM_TERRAIN_PLY = "dem_terrain.ply"
+
+
+def resolve_terrain_mode(lidar_terrain: bool, dem_terrain: bool):
+    """
+    Decide which terrain source to use from the two terrain flags.
+
+    Returns ``"dem"``, ``"lidar"`` or ``None`` (flat ground).
+
+    * DEM terrain works on its own; it does not need LiDAR terrain enabled.
+    * When both flags are set, DEM wins (this matches the old behaviour,
+      where ``dem_terrain`` overrode the LiDAR mesh) and a warning is logged.
+    """
+    if lidar_terrain and dem_terrain:
+        logger.warning(
+            "Both LiDAR and DEM terrain were requested; using the USGS 1 m DEM "
+            "for the terrain mesh and ignoring --enable-lidar-terrain. (LiDAR is "
+            "still downloaded if --enable-lidar-height-calibration is set.)"
+        )
+        return TERRAIN_MODE_DEM
+    if dem_terrain:
+        return TERRAIN_MODE_DEM
+    if lidar_terrain:
+        return TERRAIN_MODE_LIDAR
+    return None
+
+
+def resolve_roads_enabled(generate_roads: bool, building_data_source: str, terrain_mode) -> bool:
+    """
+    Return whether roads will actually be generated, warning when the
+    ``generate_roads`` request is dropped instead of ignoring it silently.
+
+    Roads are only supported on flat ground with Overture data: a road mesh is
+    a single flat polygon, so on sloped terrain it would float above or sink
+    into the ground.
+    """
+    if not generate_roads:
+        return False
+    if building_data_source != "overture":
+        logger.warning(
+            "Road generation is only supported with --building-data-source overture; "
+            "roads will NOT be generated for '%s'.",
+            building_data_source,
+        )
+        return False
+    if terrain_mode is not None:
+        logger.warning(
+            "Road generation is not supported with %s terrain (flat road meshes "
+            "can't follow sloped terrain); roads will NOT be generated. Disable "
+            "the terrain flags to include roads.",
+            "DEM" if terrain_mode == TERRAIN_MODE_DEM else "LiDAR",
+        )
+        return False
+    return True
+
+
+def prepare_terrain_and_hag(
+    *,
+    terrain_mode,
+    lidar_height_calibration: bool,
+    hag_tiff_path,
+    data_dir,
+    mesh_data_dir,
+    ground_polygon_4326,
+    ground_scale: float,
+    utm_crs,
+    center_x: float,
+    center_y: float,
+):
+    """
+    Fetch the LiDAR/DEM inputs that the requested features actually need and
+    build the terrain mesh.
+
+    What each feature needs:
+
+    * LiDAR terrain  -> ``test_hag.laz`` (point cloud). Failure is fatal.
+    * DEM terrain    -> USGS 1 m DEM tiles only. Does NOT need the LAZ/HAG.
+    * Height calibration -> ``test_hag.tif`` (HAG raster). Failure is a
+      warning; building heights fall back to Overture/OSM data.
+
+    Returns
+    -------
+    (terrain_ply_path or None, hag_tiff_path or None)
+
+    Raises
+    ------
+    RuntimeError
+        If terrain was requested and could not be produced.
+    """
+    data_dir = Path(data_dir)
+    mesh_data_dir = Path(mesh_data_dir)
+    laz_file_path = data_dir / "test_hag.laz"
+    tif_file_path = data_dir / "test_hag.tif"
+    scaled_aoi_4326 = affinity.scale(
+        ground_polygon_4326, xfact=ground_scale, yfact=ground_scale, origin="centroid"
+    )
+
+    need_laz = terrain_mode == TERRAIN_MODE_LIDAR
+    need_tif = lidar_height_calibration and hag_tiff_path is None
+
+    # ---- 1) LiDAR point cloud + HAG raster (one PDAL run produces both) ----
+    if (need_laz and not laz_file_path.exists()) or (need_tif and not tif_file_path.exists()):
+        from .USGS_LiDAR_HAG import generate_hag
+
+        try:
+            generate_hag(scaled_aoi_4326, str(data_dir), utm_crs, raise_on_error=True)
+        except Exception as exc:
+            if need_laz and not laz_file_path.exists():
+                raise RuntimeError(
+                    f"LiDAR terrain was requested but the USGS LiDAR download failed: {exc}"
+                ) from exc
+            logger.warning(
+                "USGS LiDAR HAG generation failed, so LiDAR height calibration is "
+                "disabled for this run (building heights fall back to the "
+                "building data source): %s",
+                exc,
+            )
+
+    if need_tif:
+        if tif_file_path.exists():
+            hag_tiff_path = str(tif_file_path)
+        else:
+            logger.warning(
+                "LiDAR height calibration requested but %s is not available; "
+                "continuing without it.",
+                tif_file_path,
+            )
+
+    # ---- 2) Terrain mesh ----
+    if terrain_mode is None:
+        return None, hag_tiff_path
+
+    if terrain_mode == TERRAIN_MODE_DEM:
+        terrain_ply_path = mesh_data_dir / DEM_TERRAIN_PLY
+        if not terrain_ply_path.exists():
+            logger.info("Generating terrain mesh from USGS 1 m DEM...")
+            try:
+                # Pass the scene CRS and centre so the DEM mesh lands in the
+                # same local frame as the buildings (same as the LiDAR mesh).
+                generate_terrain_mesh_dem(
+                    scaled_aoi_4326,
+                    terrain_ply_path,
+                    utm_crs=utm_crs,
+                    center_x=center_x,
+                    center_y=center_y,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"DEM terrain generation failed: {exc}") from exc
+    else:
+        terrain_ply_path = mesh_data_dir / LIDAR_TERRAIN_PLY
+        if not terrain_ply_path.exists():
+            from .lidar_terrain_mesh import generate_terrain_mesh
+
+            logger.info("Generating terrain mesh from USGS LiDAR point cloud...")
+            try:
+                generate_terrain_mesh(
+                    str(laz_file_path),
+                    str(terrain_ply_path),
+                    src_crs=utm_crs,
+                    dest_crs=utm_crs,
+                    plot_figures=False,
+                    center_x=center_x,
+                    center_y=center_y,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"LiDAR terrain generation failed: {exc}") from exc
+
+    if not terrain_ply_path.exists():
+        raise RuntimeError(
+            f"{terrain_mode.upper()} terrain was requested but {terrain_ply_path} was not created."
+        )
+    return terrain_ply_path, hag_tiff_path
+
+
 class Scene:
     """
     A class that encapsulates the logic for creating the digital twins for a given
@@ -80,7 +257,7 @@ class Scene:
         ground_material_type: str ="mat-itu_wet_ground",
         rooftop_material_type: str ="mat-itu_metal",
         wall_material_type: str ="mat-itu_concrete",
-        road_material_type: str = "mat-itu_concrete",
+        road_material_type: str = None,
         lidar_terrain:bool = False,
         dem_terrain:bool = False,
         gen_lidar_terrain_only:bool = False,
@@ -116,15 +293,19 @@ class Scene:
         wall_material_type : str, optional
             ITU material id (a key in ``ITU_MATERIALS``) used for wall meshes. Defaults to "mat-itu_concrete".
         lidar_terrain : bool, optional
-            If True, use LiDAR data to generate the ground terrain (if dem_terrain is True, uses DEM data to generate the ground terrain). Defaults to False.
+            If True, build the ground terrain from the USGS LiDAR point cloud (``mesh/lidar_terrain.ply``). Defaults to False.
         dem_terrain : bool, optional
-            If True and lidar_terrain is True, use DEM data to generate the ground terrain. Defaults to False.
+            If True, build the ground terrain from the USGS 1 m DEM (``mesh/dem_terrain.ply``). Works on its own and does not need the LiDAR LAZ file. Takes precedence over ``lidar_terrain`` when both are set (a warning is logged). Defaults to False.
+        Raises
+        ------
+        RuntimeError
+            If terrain was requested and could not be generated. (Previously the error was printed and the call returned ``1``.)
         gen_lidar_terrain_only : bool, optional
             If True, generates only the terrain mesh, no buildings or roads. Defaults to False.
         building_data_source : str, optional
             Choose which data source to use for building footprints and heights. Choices: "overture", "osm". Defaults to "overture".
         generate_roads : bool, optional
-            If True (default) and ``building_data_source == "overture"`` and ``lidar_terrain == False`` and ``dem_terrain == False``, query Overture.
+            If True and ``building_data_source == "overture"`` and no terrain is enabled, query Overture (a warning is logged and roads are skipped otherwise).
             transportation segments (``subtype == "road"``) for the AOI, buffer each
             centerline into a flat footprint using a per-class default width, and add them to the scene as flat meshes.
         road_material_type : str, optional
@@ -151,6 +332,13 @@ class Scene:
             if road_material_type is not None and road_material_type not in ITU_MATERIALS:
                 raise ValueError(f"Invalid road material type: {road_material_type}")
             resolved_road_material_type = road_material_type or ground_material_type
+
+            # Resolve flag combinations up front so conflicts are reported
+            # before any slow downloads start.
+            terrain_mode = resolve_terrain_mode(lidar_terrain, dem_terrain)
+            roads_enabled = resolve_roads_enabled(
+                generate_roads, building_data_source, terrain_mode
+            )
 
             # Determine the UTM projection from the first point
             projection_UTM_EPSG_code = get_utm_epsg_code_from_gps(
@@ -326,51 +514,28 @@ class Scene:
             ET.SubElement(scene, "default", name="scenegen_center_lon", value=f"{ground_polygon_4326.envelope.centroid.x:.6f}")
 
             # ---------------------------------------------------------------------
-            # Query USGS 3DEP LiDAR data and generate GEOTIFF file for building height calibration
+            # Terrain mesh (LiDAR or DEM) + HAG raster for height calibration.
+            # Only the inputs the enabled features actually need are fetched;
+            # a terrain failure raises instead of being printed and swallowed.
             # ---------------------------------------------------------------------
-            try:
-                laz_file_path = Path(os.path.join(data_dir, "test_hag.laz"))
-                tif_file_path = Path(os.path.join(data_dir, "test_hag.tif"))
-                if lidar_terrain or lidar_height_calibration:
-                    if not laz_file_path.exists() or not tif_file_path.exists():
-                        
-                        from .USGS_LiDAR_HAG import generate_hag
-                        
-                        generate_hag(affinity.scale(ground_polygon_4326, xfact=ground_scale, yfact=ground_scale, origin='centroid'), data_dir, projection_UTM_EPSG_code)
+            terrain_ply_path, hag_tiff_path = prepare_terrain_and_hag(
+                terrain_mode=terrain_mode,
+                lidar_height_calibration=lidar_height_calibration,
+                hag_tiff_path=hag_tiff_path,
+                data_dir=data_dir,
+                mesh_data_dir=mesh_data_dir,
+                ground_polygon_4326=ground_polygon_4326,
+                ground_scale=ground_scale,
+                utm_crs=projection_UTM_EPSG_code,
+                center_x=center_x,
+                center_y=center_y,
+            )
+            if gen_lidar_terrain_only:
+                logger.info("gen_lidar_terrain_only=True: terrain done, skipping buildings and roads.")
+                return
 
-                    if lidar_height_calibration and hag_tiff_path is None and tif_file_path.exists():
-                        hag_tiff_path = str(tif_file_path)
-                    
-                if lidar_terrain:
-                    from .lidar_terrain_mesh import generate_terrain_mesh
-        
-                    assert laz_file_path.exists(), f"LAZ file does not exist: {laz_file_path}"
-        
-                    assert tif_file_path.exists(), f"TIF file does not exist: {tif_file_path}"
-                    print("Checking lidar_terrain.ply")
-                    if not Path(os.path.join(data_dir,"mesh" ,"lidar_terrain.ply")).exists():
+            surface_mesh = pv.read(terrain_ply_path) if terrain_ply_path is not None else None
 
-                        if dem_terrain:
-                            generate_terrain_mesh_dem(
-                                affinity.scale(ground_polygon_4326, xfact=ground_scale, yfact=ground_scale, origin='centroid'),
-                                os.path.join(mesh_data_dir, f"lidar_terrain.ply")
-                            )
-                        else:
-                            generate_terrain_mesh(os.path.join(data_dir, "test_hag.laz"),
-                                os.path.join(mesh_data_dir, f"lidar_terrain.ply"), src_crs=projection_UTM_EPSG_code, dest_crs=projection_UTM_EPSG_code,
-                                plot_figures=False, center_x=center_x, center_y=center_y
-                            )
-                if gen_lidar_terrain_only:
-                    print("gen_lidar_terrain_only: True")
-                    return
-            except Exception as e:
-                print(e)
-
-            if lidar_terrain:
-                lidar_terrain_ply_path = Path(os.path.join(data_dir, "mesh", "lidar_terrain.ply"))
-                if not lidar_terrain_ply_path.exists():
-                    return 1
-                surface_mesh = pv.read(lidar_terrain_ply_path)
 
             #######Open3D#######
             outer_xy = unique_coords(
@@ -425,8 +590,8 @@ class Scene:
             )
 
             sionna_shape = ET.SubElement(scene, "shape", type="ply", id=f"mesh-ground")
-            if lidar_terrain:
-                ET.SubElement(sionna_shape, "string", name="filename", value=f"mesh/lidar_terrain.ply")
+            if terrain_ply_path is not None:
+                ET.SubElement(sionna_shape, "string", name="filename", value=f"mesh/{terrain_ply_path.name}")
             else:
                 ET.SubElement(sionna_shape, "string", name="filename", value=f"mesh/ground.ply")
             bsdf_ref = ET.SubElement(
@@ -670,7 +835,7 @@ class Scene:
                 # USE THE ABOVE SECTION FOR BUILDING CENTROID AND HEIGHT INFO
                 # WITH LIDAR TERRAIN TURNED OFF
                 
-                if lidar_terrain:
+                if surface_mesh is not None:  # LiDAR or DEM terrain
                     mesh = surface_mesh
                     # Z bounds of the mesh
                     bottom, top = mesh.bounds[-2:]
@@ -827,9 +992,11 @@ class Scene:
             del hag_handler
 
             # ---------------------------------------------------------------------
-            # Query Overture roads within the bounding box and mesh them flat
+            # Query Overture roads within the bounding box and mesh them flat.
+            # roads_enabled is False with any terrain (see resolve_roads_enabled,
+            # which already warned the user at the top of this call).
             # ---------------------------------------------------------------------
-            if not lidar_terrain and not dem_terrain and generate_roads:
+            if roads_enabled:
                 try:
                     roads = load_overture_roads_for_aoi(
                         ground_polygon_4326_bbox,
@@ -908,33 +1075,10 @@ class Scene:
                         continue
                     nv = len(v)
 
-                    if lidar_terrain:
-                        mesh = surface_mesh
-                        bottom, top = mesh.bounds[-2:]
-
-                        def ray_trace_z(x, y):
-                            start = [x, y, bottom - 1.0]
-                            stop = [x, y, top + 1.0]
-                            trace_points, _ = mesh.ray_trace(start, stop)
-                            if trace_points.shape[0] == 0:
-                                return 1e299
-                            return np.max(trace_points[:, 2])
-
-                        from concurrent.futures import ThreadPoolExecutor
-
-                        with ThreadPoolExecutor() as executor:
-                            res_z_parallel = list(
-                                executor.map(lambda pt: ray_trace_z(pt[0], pt[1]), outer_xy)
-                            )
-                        road_z_value = int(np.floor(np.min(res_z_parallel)))
-                        if road_z_value > 1e20:
-                            road_z_value = 0
-                    else:
-                        road_z_value = 0
-
-                    # Roads are perfectly flat and coplanar with the ground/terrain
-                    # mesh; lift them slightly to avoid z-fighting in the renderer.
-                    road_z_value += ROAD_Z_OFFSET_M
+                    # Roads only run on flat ground (z = 0). They are coplanar
+                    # with ground.ply, so lift them slightly to avoid z-fighting.
+                    # (The old terrain ray-trace branch here was unreachable.)
+                    road_z_value = ROAD_Z_OFFSET_M
 
                     points = np.concatenate(
                         [v, np.full((nv, 1), fill_value=road_z_value)], axis=1
@@ -997,6 +1141,10 @@ class Scene:
                 raise ValueError(f"Invalid rooftop material type: {rooftop_material_type}")
             if wall_material_type not in ITU_MATERIALS:
                 raise ValueError(f"Invalid wall material type: {wall_material_type}")
+
+            terrain_mode = resolve_terrain_mode(lidar_terrain, dem_terrain)
+            # Roads are Overture-only; this just warns instead of silently ignoring the flag.
+            resolve_roads_enabled(generate_roads, building_data_source, terrain_mode)
             
             # ---------------------------------------------------------------------
             # Setup OSM server and transforms
@@ -1179,45 +1327,27 @@ class Scene:
             ET.SubElement(scene, "default", name="scenegen_center_lon", value=f"{ground_polygon_4326.envelope.centroid.x:.6f}")
 
             # ---------------------------------------------------------------------
-            # Query USGS 3DEP LiDAR data and generate GEOTIFF file for building height calibration
+            # Terrain mesh (LiDAR or DEM) + HAG raster for height calibration.
+            # Only the inputs the enabled features actually need are fetched;
+            # a terrain failure raises instead of being printed and swallowed.
             # ---------------------------------------------------------------------
-            try:
-                laz_file_path = Path(os.path.join(data_dir, "test_hag.laz"))
-                tif_file_path = Path(os.path.join(data_dir, "test_hag.tif"))
-                if lidar_terrain or lidar_height_calibration:
-                    if not laz_file_path.exists() or not tif_file_path.exists():
-                        
-                        from .USGS_LiDAR_HAG import generate_hag
-                        
-                        generate_hag(affinity.scale(ground_polygon_4326, xfact=ground_scale, yfact=ground_scale, origin='centroid'), data_dir, projection_UTM_EPSG_code)
-                    
-                if lidar_terrain:
-                    from .lidar_terrain_mesh import generate_terrain_mesh
-    
-                    assert laz_file_path.exists(), f"LAZ file does not exist: {laz_file_path}"
-                    assert tif_file_path.exists(), f"TIF file does not exist: {tif_file_path}"
-                    print("Skip the lidar_terrain.ply")
-                    if not Path(os.path.join(data_dir,"mesh" ,"lidar_terrain.ply")).exists():
-                        if dem_terrain:
-                            generate_terrain_mesh_dem(
-                                affinity.scale(ground_polygon_4326, xfact=ground_scale, yfact=ground_scale, origin='centroid'),
-                                os.path.join(mesh_data_dir, f"lidar_terrain.ply")
-                            )
-                        else:
-                            generate_terrain_mesh(os.path.join(data_dir, "test_hag.laz"),
-                                os.path.join(mesh_data_dir, f"lidar_terrain.ply"), src_crs=projection_UTM_EPSG_code, dest_crs=projection_UTM_EPSG_code,
-                                plot_figures=False, center_x=center_x, center_y=center_y
-                            )
-                if gen_lidar_terrain_only:
-                    print("gen_lidar_terrain_only: True")
-                    return
-            except Exception as e:
-                print(e)
-            if lidar_terrain:
-                lidar_terrain_ply_path = Path(os.path.join(data_dir,"mesh" ,"lidar_terrain.ply"))
-                if not lidar_terrain_ply_path.exists():
-                    return 1
-                surface_mesh = pv.read(lidar_terrain_ply_path)
+            terrain_ply_path, hag_tiff_path = prepare_terrain_and_hag(
+                terrain_mode=terrain_mode,
+                lidar_height_calibration=lidar_height_calibration,
+                hag_tiff_path=hag_tiff_path,
+                data_dir=data_dir,
+                mesh_data_dir=mesh_data_dir,
+                ground_polygon_4326=ground_polygon_4326,
+                ground_scale=ground_scale,
+                utm_crs=projection_UTM_EPSG_code,
+                center_x=center_x,
+                center_y=center_y,
+            )
+            if gen_lidar_terrain_only:
+                logger.info("gen_lidar_terrain_only=True: terrain done, skipping buildings and roads.")
+                return
+
+            surface_mesh = pv.read(terrain_ply_path) if terrain_ply_path is not None else None
 
             #######Open3D#######
             outer_xy = unique_coords(
@@ -1269,8 +1399,8 @@ class Scene:
             )
 
             sionna_shape = ET.SubElement(scene, "shape", type="ply", id=f"mesh-ground")
-            if lidar_terrain:
-                ET.SubElement(sionna_shape, "string", name="filename", value=f"mesh/lidar_terrain.ply")
+            if terrain_ply_path is not None:
+                ET.SubElement(sionna_shape, "string", name="filename", value=f"mesh/{terrain_ply_path.name}")
             else:
                 ET.SubElement(sionna_shape, "string", name="filename", value=f"mesh/ground.ply")
             bsdf_ref = ET.SubElement(
@@ -1400,7 +1530,7 @@ class Scene:
                     reorder_localize_coords(building_polygon.exterior, center_x, center_y)
                 )
                 
-                if lidar_terrain:
+                if surface_mesh is not None:  # LiDAR or DEM terrain
                     mesh = surface_mesh
                     # Z bounds of the mesh
                     bottom, top = mesh.bounds[-2:]
@@ -1611,4 +1741,4 @@ class Scene:
         new = np.asarray(temp)
 
         merged = np.maximum(current, new)
-        self._building_map = Image.fromarray(merged.astype(np.uint32))
+        self._building_map = Image.fromarray(merged.astype(np.int32))

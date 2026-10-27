@@ -5,6 +5,9 @@ Utilities sub-package for the Scene Generation library.
 import pyproj
 from pyproj import Transformer, CRS
 
+import logging
+logger = logging.getLogger(__name__)
+
 from shapely.geometry import (
     Polygon,
     Point

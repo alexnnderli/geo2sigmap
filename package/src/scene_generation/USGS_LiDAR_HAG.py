@@ -297,14 +297,18 @@ def make_DEM_pipeline(extent_epsg3857, usgs_3dep_dataset_name, pc_resolution, de
 
     return dem_pipeline
 
-def generate_hag(polygon, data_dir, CRS="EPSG:3857"):
+def generate_hag(polygon, data_dir, CRS="EPSG:3857", raise_on_error=False):
     """
     Generate Height Above Ground (HAG) data for a given polygon area.
     
     Parameters:
         polygon (shapely.geometry.Polygon): The area of interest polygon in EPSG:4326
         data_dir (str): Directory where output files will be saved
-        
+        CRS: Output CRS (pyproj CRS or "EPSG:xxxx" string)
+        raise_on_error (bool): If True, re-raise PDAL failures and raise if
+            test_hag.laz / test_hag.tif were not written. If False (legacy
+            behaviour) errors are only printed.
+
     Returns:
         None: Saves HAG data as GeoTIFF file in the specified data directory
     """
@@ -330,7 +334,9 @@ def generate_hag(polygon, data_dir, CRS="EPSG:3857"):
     geometries_GCS = df['geometry']
     geometries_EPSG3857 = gpd.GeoSeries(projected_geoms)
 
-    print('Done. 3DEP polygons downloaded and projected to ', CRS.to_string())
+    crs_str = CRS.to_string() if hasattr(CRS, "to_string") else str(CRS)
+    print('Done. 3DEP polygons downloaded and projected to ', crs_str)
+ 
 
     AOI_EPSG3857 = proj_to_3857(polygon, "EPSG:4326")[1]
     print("Area of Interest:", AOI_EPSG3857)
@@ -361,7 +367,7 @@ def generate_hag(polygon, data_dir, CRS="EPSG:3857"):
             filterNoise=True, 
             reclassify=False, 
             savePointCloud=True, 
-            outCRS=CRS.to_string(),
+            outCRS=crs_str,
             pc_outName=os.path.join(data_dir, 'pointcloud_test'), 
             pc_outType='laz', 
             demType='hag',
@@ -372,10 +378,28 @@ def generate_hag(polygon, data_dir, CRS="EPSG:3857"):
         )
         dsm_pipeline = pdal.Pipeline(json.dumps(dsm_pipeline))
         dsm_pipeline.execute()
-        print("Successfully generated HAG data")
-        
+
     except Exception as e:
         print(f"Error generating HAG data: {e}")
+        if raise_on_error:
+            raise
+        return
+
+    # PDAL writes the point cloud (writers.las) before the HAG raster
+    # (writers.gdal), so a failure late in the pipeline can leave a .laz
+    # with no .tif. Check both outputs instead of assuming success.
+    # Note: make_DEM_pipeline passes dem_outName as the point-cloud name, so
+    # the point cloud is written as test_hag.laz (not pointcloud_test.laz).
+    expected = [os.path.join(data_dir, "test_hag.laz"), os.path.join(data_dir, "test_hag.tif")]
+    missing = [p for p in expected if not os.path.exists(p)]
+    if missing:
+        msg = f"PDAL finished but did not write: {', '.join(missing)}"
+        print(f"Error generating HAG data: {msg}")
+        if raise_on_error:
+            raise RuntimeError(msg)
+        return
+    print("Successfully generated HAG data")
+
 
 def main():
     """

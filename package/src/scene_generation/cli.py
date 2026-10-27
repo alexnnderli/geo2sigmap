@@ -71,6 +71,16 @@ def setup_logging(log_file="debug.log"):
 """
 CLI entry point for Scene Generation Pipeline.
 """
+
+def run_scene(logger, scene_instance, *args, **kwargs):
+    """Run a Scene and turn terrain/data failures into a clean error + exit code 1."""
+    try:
+        return scene_instance(*args, **kwargs)
+    except RuntimeError as exc:
+        logger.error("Scene generation failed: %s", exc)
+        sys.exit(1)
+
+        
 def main():
     """
     Main function to parse arguments and dispatch subcommands.
@@ -143,13 +153,16 @@ def main():
     common_parser.add_argument(
         "--enable-lidar-terrain",
         action="store_true",
-        help="Using USGS LiDAR data to generate terrain mesh.",
+        help="Generate the terrain mesh from the USGS 3DEP LiDAR point cloud.",
     )
 
     common_parser.add_argument(
         "--enable-dem-terrain",
         action="store_true",
-        help="Using USGS 1M DEM data to generate terrain mesh.",
+        help=(
+            "Generate the terrain mesh from the USGS 1 m DEM. Works on its own (no "
+            "--enable-lidar-terrain needed). If both terrain flags are given, the DEM is used."
+        ),
     )
 
     common_parser.add_argument(
@@ -338,7 +351,7 @@ def main():
             f"Check the bbox at http://bboxfinder.com/#{min_lat:.{4}f},{min_lon:.{4}f},{max_lat:.{4}f},{max_lon:.{4}f}"
         )
         scene_instance = Scene()
-        scene_instance(
+        run_scene(logger, scene_instance,
             [
                 [min_lon, min_lat],
                 [min_lon, max_lat],
@@ -369,7 +382,7 @@ def main():
             f"Check the bbox at http://bboxfinder.com/#{min_lat:.{4}f},{min_lon:.{4}f},{max_lat:.{4}f},{max_lon:.{4}f}"
         )
         scene_instance = Scene()
-        scene_instance(
+        run_scene(logger, scene_instance,
             polygon_points_gps,
             args.data_dir,
             None,

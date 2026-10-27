@@ -24,6 +24,7 @@ def clip_reproject_dem_to_wgs84_utm(
     urls: List[str],
     mode: str = "single_zone",            # 'single_zone' or 'multi_zone'
     target_zone: Optional[int] = None,    # used only when mode='single_zone'
+    target_epsg: Optional[int] = None,    # single_zone: exact EPSG to use (overrides target_zone)
     dst_res_m: float | Tuple[float, float] = 1.0,
     mosaic: bool = True,
     out_prefix: str = "dem_wgs84utm",
@@ -236,9 +237,10 @@ def clip_reproject_dem_to_wgs84_utm(
     # ---------- SINGLE-ZONE ----------
     if mode == "single_zone":
         lon_c, lat_c = aoi_geom.centroid.x, aoi_geom.centroid.y
-        zone = target_zone if target_zone else _utm_zone_from_lon(lon_c)
-        target_epsg = (32600 + zone) if lat_c >= 0 else (32700 + zone)
-        _log(f"[DBG] single_zone target: zone={zone}, EPSG={target_epsg} (from centroid lon={lon_c:.6f}, lat={lat_c:.6f})")
+        if target_epsg is None:
+            zone = target_zone if target_zone else _utm_zone_from_lon(lon_c)
+            target_epsg = (32600 + zone) if lat_c >= 0 else (32700 + zone)
+        _log(f"[DBG] single_zone target: EPSG={target_epsg} (AOI centroid lon={lon_c:.6f}, lat={lat_c:.6f})")
 
         per_tile: List[Dict[str, Any]] = []
         skipped: List[str] = []
@@ -336,7 +338,9 @@ def dem_to_ply(
     out_ply,
     stride=1,
     z_scale=1.0,
-    drop_nodata=True
+    drop_nodata=True,
+    center_x=None,
+    center_y=None,
 ):
     """
     Convert a DEM GeoTIFF to a triangle mesh and save as .ply
@@ -353,6 +357,13 @@ def dem_to_ply(
         Scale factor to apply to Z values.
     drop_nodata : bool
         If True, skips faces touching nodata cells.
+        center_x, center_y : float, optional
+        Scene centre in the DEM's CRS. If given, XY are translated so this
+        point is the origin and Z is shifted so the DEM cell nearest the
+        centre is z = 0 (same convention as lidar_terrain_mesh). This keeps
+        the terrain aligned with buildings/roads, which are localized to the
+        same centre. If omitted, the legacy behaviour (centre the mesh on
+        its own centroid) is used.
     """
     with rasterio.open(in_tif) as ds:
         dem = ds.read(1)
@@ -364,22 +375,34 @@ def dem_to_ply(
     dem = dem[::stride, ::stride]
     height, width = dem.shape
 
-    # Create XY from affine transform
-    # For a grid, x = x0 + col*ax + row*bx, y = y0 + col*ay + row*by
-    rows = np.arange(height)
-    cols = np.arange(width)
+    # XY of each (subsampled) pixel CENTRE from the affine transform.
+    # (row/col indices are in the original grid, hence * stride.)
+    rows = np.arange(height) * stride + 0.5
+    cols = np.arange(width) * stride + 0.5
     cols2d, rows2d = np.meshgrid(cols, rows)
     xs = transform.c + cols2d * transform.a + rows2d * transform.b
     ys = transform.f + cols2d * transform.d + rows2d * transform.e
 
     zs = dem.astype(np.float64) * z_scale
 
+    valid = np.isfinite(zs)
+    if nodata is not None:
+        valid &= dem != nodata
+
+    centered_on_scene = center_x is not None and center_y is not None
+    if centered_on_scene:
+        if not valid.any():
+            raise ValueError(f"DEM {in_tif} has no valid cells.")
+        # Ground reference: valid cell closest to the scene centre.
+        d2 = (xs - center_x) ** 2 + (ys - center_y) ** 2
+        d2[~valid] = np.inf
+        z_ref = zs.flat[int(np.argmin(d2))]
+        xs = xs - center_x
+        ys = ys - center_y
+        zs = np.where(valid, zs - z_ref, zs)
+
     # Flatten vertices
     verts = np.column_stack([xs.ravel(), ys.ravel(), zs.ravel()])
-
-    # --- Center mesh at (0,0,0) ---
-    center = verts.mean(axis=0)   # centroid
-    verts -= center
 
     # Build faces for a regular grid (2 triangles per cell)
     # Vertex index helper
@@ -401,29 +424,25 @@ def dem_to_ply(
         np.concatenate([v11.ravel(), v01.ravel()])
     ])
 
-    if drop_nodata and nodata is not None:
+    if drop_nodata:
         # Mask out faces that touch any nodata vertex
-        mask = (zs != nodata)
-        m00 = mask[:-1, :-1]
-        m10 = mask[1:,  :-1]
-        m01 = mask[:-1, 1:]
-        m11 = mask[1:,  1:]
-        good_quad = (m00 & m10 & m11 & m00)  # for first tri
-        good_quad2 = (m00 & m11 & m01 & m00) # for second tri
-
-        # Interleave the two boolean masks to match faces stacking order
-        g1 = good_quad.ravel()
-        g2 = good_quad2.ravel()
-        good = np.concatenate([g1, g2])
+        m00 = valid[:-1, :-1]
+        m10 = valid[1:,  :-1]
+        m01 = valid[:-1, 1:]
+        m11 = valid[1:,  1:]
+        good = np.concatenate([(m00 & m10 & m11).ravel(), (m00 & m11 & m01).ravel()])
         faces = faces[good]
 
     # Build and export with trimesh
     mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
-    mesh.rezero()
     mesh.update_faces(mesh.nondegenerate_faces())
     mesh.update_faces(mesh.unique_faces())
     mesh.remove_unreferenced_vertices()
-    mesh.vertices -= mesh.centroid
+
+    if not centered_on_scene:
+        # Legacy behaviour: centre on the mesh itself. Note this does NOT line
+        # up with buildings, which are localized to the scene envelope centre.
+        mesh.vertices -= mesh.centroid
 
     mesh.export(out_ply)
 
