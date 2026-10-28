@@ -14,3 +14,10 @@ plot_temp.png
 **/resources.geojson
 **/scenes
 *.pth
+e2e_out/
+e2e_old/
+scene_old/
+scene_new/
+renders/
+
+preivew.ipynb
